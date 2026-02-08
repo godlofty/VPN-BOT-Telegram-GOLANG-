@@ -1,0 +1,697 @@
+package handlers
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"vpn-telegram-bot/internal/service"
+
+	tele "gopkg.in/telebot.v3"
+)
+
+// Handler обработчики бота
+type Handler struct {
+	svc      *service.Service
+	adminIDs []int64
+	// userMenus хранит ID последнего сообщения меню для каждого пользователя
+	userMenus sync.Map // map[int64]int (userID -> messageID)
+}
+
+// New создаёт новый handler
+func New(svc *service.Service, adminIDs []int64) *Handler {
+	return &Handler{
+		svc:      svc,
+		adminIDs: adminIDs,
+	}
+}
+
+// saveMenuMessage сохраняет ID сообщения меню пользователя
+func (h *Handler) saveMenuMessage(userID int64, msgID int) {
+	h.userMenus.Store(userID, msgID)
+}
+
+// getMenuMessage получает ID сообщения меню пользователя
+func (h *Handler) getMenuMessage(userID int64) (int, bool) {
+	if val, ok := h.userMenus.Load(userID); ok {
+		return val.(int), true
+	}
+	return 0, false
+}
+
+// deleteOldMenu удаляет старое меню пользователя
+func (h *Handler) deleteOldMenu(c tele.Context) {
+	if msgID, ok := h.getMenuMessage(c.Sender().ID); ok {
+		c.Bot().Delete(&tele.Message{
+			ID:   msgID,
+			Chat: c.Chat(),
+		})
+	}
+}
+
+// respond отвечает на callback и убирает анимацию загрузки
+func respond(c tele.Context) {
+	if c.Callback() != nil {
+		c.Respond()
+	}
+}
+
+// editOrEditCaption автоматически выбирает EditCaption (если есть фото) или Edit
+func editOrEditCaption(c tele.Context, text string, menu *tele.ReplyMarkup) error {
+	if c.Message() != nil && c.Message().Photo != nil {
+		return c.EditCaption(text, menu)
+	}
+	return c.Edit(text, menu)
+}
+
+// editOrSend редактирует сообщение если это callback, иначе отправляет новое
+// Использует EditCaption если сообщение содержит фото, иначе Edit
+func (h *Handler) editOrSend(c tele.Context, text string, menu *tele.ReplyMarkup) error {
+	respond(c)
+
+	if c.Callback() != nil {
+		// Проверяем, есть ли фото в исходном сообщении
+		if c.Message() != nil && c.Message().Photo != nil {
+			// Используем EditCaption чтобы сохранить изображение
+			return c.EditCaption(text, menu)
+		}
+		// Если нет фото, используем обычный Edit
+		return c.Edit(text, menu)
+	}
+
+	// Для команд — удаляем старое меню и отправляем новое
+	h.deleteOldMenu(c)
+	msg, err := c.Bot().Send(c.Chat(), text, menu)
+	if err != nil {
+		return err
+	}
+	h.saveMenuMessage(c.Sender().ID, msg.ID)
+	return nil
+}
+
+// Register регистрирует все обработчики
+func (h *Handler) Register(b *tele.Bot) {
+	// Commands
+	b.Handle("/start", h.HandleStart)
+	b.Handle("/help", h.HandleHelp)
+	b.Handle("/guide", h.HandleGuide)
+	b.Handle("/tariffs", h.HandleTariffs)
+	b.Handle("/mysubs", h.HandleMySubs)
+	b.Handle("/privacy", h.HandlePrivacy)
+
+	// Callbacks
+	b.Handle(&tele.Btn{Unique: "tariffs"}, h.HandleTariffs)
+	b.Handle(&tele.Btn{Unique: "mysubs"}, h.HandleMySubs)
+	b.Handle(&tele.Btn{Unique: "instruction"}, h.HandleInstruction)
+	b.Handle(&tele.Btn{Unique: "help"}, h.HandleHelp)
+	b.Handle(&tele.Btn{Unique: "back_main"}, h.HandleBackMain)
+	b.Handle(&tele.Btn{Unique: "privacy"}, h.HandlePrivacy)
+
+	// Product selection
+	b.Handle(&tele.Btn{Unique: "product"}, h.HandleProductSelect)
+
+	// Plan selection (months)
+	b.Handle(&tele.Btn{Unique: "plan"}, h.HandlePlanSelect)
+
+	// Subscription details
+	b.Handle(&tele.Btn{Unique: "sub"}, h.HandleSubDetail)
+	b.Handle(&tele.Btn{Unique: "copy_key"}, h.HandleCopyKey)
+	b.Handle(&tele.Btn{Unique: "extend"}, h.HandleExtend)
+
+	// Instructions
+	b.Handle(&tele.Btn{Unique: "instr_android"}, h.HandleInstrAndroid)
+	b.Handle(&tele.Btn{Unique: "instr_windows"}, h.HandleInstrWindows)
+	b.Handle(&tele.Btn{Unique: "instr_iphone"}, h.HandleInstrIphone)
+	b.Handle(&tele.Btn{Unique: "instr_mac"}, h.HandleInstrMac)
+
+	// Help section
+	b.Handle(&tele.Btn{Unique: "faq"}, h.HandleFAQ)
+	b.Handle(&tele.Btn{Unique: "reviews"}, h.HandleReviews)
+	b.Handle(&tele.Btn{Unique: "leave_review"}, h.HandleLeaveReview)
+	b.Handle(&tele.Btn{Unique: "support"}, h.HandleSupport)
+}
+
+// ================= MAIN MENU =================
+
+// HandleStart обрабатывает /start
+func (h *Handler) HandleStart(c tele.Context) error {
+	log.Printf("👤 User: @%s | ID: %d", c.Sender().Username, c.Sender().ID)
+
+	// Получаем или создаём пользователя
+	_, err := h.svc.GetOrCreateUser(context.Background(), c.Sender().ID, c.Sender().Username)
+	if err != nil {
+		log.Printf("Error getting user: %v", err)
+	}
+
+	// Удаляем старое меню
+	h.deleteOldMenu(c)
+
+	text := `🐸 Йоу! Это PEPE VPN
+
+Безопасный и быстрый VPN для свободного интернета.
+
+Выбери действие:`
+
+	menu := h.mainMenuKeyboard()
+
+	msg, err := c.Bot().Send(c.Chat(), text, menu)
+	if err != nil {
+		return err
+	}
+	h.saveMenuMessage(c.Sender().ID, msg.ID)
+	return nil
+}
+
+// HandleBackMain возвращает в главное меню (через EditCaption)
+func (h *Handler) HandleBackMain(c tele.Context) error {
+	respond(c)
+
+	text := `🐸 Йоу! Это PEPE VPN
+
+Безопасный и быстрый VPN для свободного интернета.
+
+Выбери действие:`
+
+	menu := h.mainMenuKeyboard()
+	return editOrEditCaption(c, text, menu)
+}
+
+// mainMenuKeyboard возвращает клавиатуру главного меню
+func (h *Handler) mainMenuKeyboard() *tele.ReplyMarkup {
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(
+			menu.Data("💎 Тарифы", "tariffs"),
+			menu.Data("🔑 Мои подписки", "mysubs"),
+		),
+		menu.Row(
+			menu.Data("📚 Инструкция", "instruction"),
+			menu.Data("🛟 Помощь", "help"),
+		),
+	)
+	return menu
+}
+
+// ================= TARIFFS =================
+
+// HandleTariffs показывает тарифы
+func (h *Handler) HandleTariffs(c tele.Context) error {
+	respond(c)
+
+	products, err := h.svc.GetAllProducts(context.Background())
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Ошибка загрузки"})
+	}
+
+	text := "🌍 Выберите локацию сервера:"
+
+	menu := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	for _, p := range products {
+		btnText := fmt.Sprintf("%s %s — %d ₽/мес", p.CountryFlag, p.Name, int(p.BasePrice))
+		btn := menu.Data(btnText, "product", strconv.FormatInt(p.ID, 10))
+		rows = append(rows, menu.Row(btn))
+	}
+
+	rows = append(rows, menu.Row(menu.Data("⬅️ Назад", "back_main")))
+	menu.Inline(rows...)
+
+	if c.Callback() != nil {
+		return editOrEditCaption(c, text, menu)
+	}
+	return h.editOrSend(c, text, menu)
+}
+
+// HandleProductSelect показывает детали продукта
+func (h *Handler) HandleProductSelect(c tele.Context) error {
+	respond(c)
+
+	productID, _ := strconv.ParseInt(c.Callback().Data, 10, 64)
+
+	product, err := h.svc.GetProductByID(context.Background(), productID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Продукт не найден"})
+	}
+
+	plans := h.svc.GetPricingPlans(product.BasePrice)
+
+	desc := product.Description
+	if desc == "" {
+		desc = "Стабильное подключение"
+	}
+
+	text := fmt.Sprintf(`%s %s
+
+💰 Цена: %d ₽/мес
+📝 %s
+
+Скидки: 6 мес -10%%, 12 мес -20%%
+
+Выберите срок:`, product.CountryFlag, product.Name, int(product.BasePrice), desc)
+
+	menu := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	for _, plan := range plans {
+		var btnText string
+		if plan.Discount > 0 {
+			btnText = fmt.Sprintf("%d мес (-%d%%) — %d ₽", plan.Months, plan.Discount, int(plan.Price))
+		} else if plan.Months == 1 {
+			btnText = fmt.Sprintf("1 мес — %d ₽", int(plan.Price))
+		} else {
+			btnText = fmt.Sprintf("%d мес — %d ₽", plan.Months, int(plan.Price))
+		}
+		btn := menu.Data(btnText, "plan", fmt.Sprintf("%d:%d", productID, plan.Months))
+		rows = append(rows, menu.Row(btn))
+	}
+
+	rows = append(rows, menu.Row(menu.Data("⬅️ Назад", "tariffs")))
+	menu.Inline(rows...)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandlePlanSelect обрабатывает выбор плана
+func (h *Handler) HandlePlanSelect(c tele.Context) error {
+	respond(c)
+
+	parts := strings.Split(c.Callback().Data, ":")
+	if len(parts) != 2 {
+		return c.Respond(&tele.CallbackResponse{Text: "Ошибка"})
+	}
+
+	productID, _ := strconv.ParseInt(parts[0], 10, 64)
+	months, _ := strconv.Atoi(parts[1])
+
+	product, err := h.svc.GetProductByID(context.Background(), productID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Продукт не найден"})
+	}
+
+	price, discount := h.svc.CalculatePrice(product.BasePrice, months)
+
+	var discountText string
+	if discount > 0 {
+		discountText = fmt.Sprintf(" (-%d%%)", discount)
+	}
+
+	text := fmt.Sprintf(`💳 Оформление подписки
+
+%s %s
+📅 Срок: %d мес.
+💰 Итого: %d ₽%s
+
+Выберите способ оплаты:`, product.CountryFlag, product.Name, months, int(price), discountText)
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.Data("💳 Картой РФ", "pay_card", c.Callback().Data)),
+		menu.Row(menu.Data("🪙 Криптовалюта", "pay_crypto", c.Callback().Data)),
+		menu.Row(menu.Data("💰 С баланса", "pay_balance", c.Callback().Data)),
+		menu.Row(menu.Data("⬅️ Назад", "product", strconv.FormatInt(productID, 10))),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// ================= MY SUBSCRIPTIONS =================
+
+// HandleMySubs показывает подписки пользователя
+func (h *Handler) HandleMySubs(c tele.Context) error {
+	respond(c)
+
+	user, err := h.svc.GetOrCreateUser(context.Background(), c.Sender().ID, c.Sender().Username)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Ошибка"})
+	}
+
+	subs, err := h.svc.GetUserSubscriptions(context.Background(), user.ID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Ошибка загрузки"})
+	}
+
+	menu := &tele.ReplyMarkup{}
+
+	if len(subs) == 0 {
+		text := `🔑 Мои подписки
+
+У вас пока нет активных подписок.
+Выберите тариф и подключайтесь!`
+
+		menu.Inline(
+			menu.Row(menu.Data("💎 Выбрать тариф", "tariffs")),
+			menu.Row(menu.Data("⬅️ Назад", "back_main")),
+		)
+
+		if c.Callback() != nil {
+			return editOrEditCaption(c, text, menu)
+		}
+		return h.editOrSend(c, text, menu)
+	}
+
+	text := "🔑 Мои подписки:\n"
+
+	var rows []tele.Row
+
+	for _, sub := range subs {
+		status := "✅"
+		if sub.ExpiresAt.Before(time.Now()) || !sub.IsActive {
+			status = "❌"
+		}
+
+		btnText := fmt.Sprintf("%s %s %s №%d", status, sub.Product.CountryFlag, sub.Product.Name, sub.ID)
+		btn := menu.Data(btnText, "sub", strconv.FormatInt(sub.ID, 10))
+		rows = append(rows, menu.Row(btn))
+	}
+
+	rows = append(rows, menu.Row(menu.Data("⬅️ Назад", "back_main")))
+	menu.Inline(rows...)
+
+	if c.Callback() != nil {
+		return editOrEditCaption(c, text, menu)
+	}
+	return h.editOrSend(c, text, menu)
+}
+
+// HandleSubDetail показывает детали подписки
+func (h *Handler) HandleSubDetail(c tele.Context) error {
+	respond(c)
+
+	subID, _ := strconv.ParseInt(c.Callback().Data, 10, 64)
+
+	sub, err := h.svc.GetSubscriptionByID(context.Background(), subID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подписка не найдена"})
+	}
+
+	status := "✅ Активна"
+	if sub.ExpiresAt.Before(time.Now()) || !sub.IsActive {
+		status = "❌ Истекла"
+	}
+
+	text := fmt.Sprintf(`📦 Подписка №%d
+
+%s %s
+%s
+📅 До: %s
+
+🔑 Ключ (нажмите чтобы скопировать):`,
+		sub.ID, sub.Product.CountryFlag, sub.Product.Name, status, sub.ExpiresAt.Format("02.01.2006 15:04"))
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.Data("📋 Получить ключ", "copy_key", strconv.FormatInt(subID, 10))),
+		menu.Row(menu.Data("🔄 Продлить", "extend", strconv.FormatInt(subID, 10))),
+		menu.Row(menu.Data("📚 Инструкция", "instruction")),
+		menu.Row(menu.Data("⬅️ Назад", "mysubs")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleCopyKey отправляет ключ отдельным сообщением
+func (h *Handler) HandleCopyKey(c tele.Context) error {
+	subID, _ := strconv.ParseInt(c.Callback().Data, 10, 64)
+
+	sub, err := h.svc.GetSubscriptionByID(context.Background(), subID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Ошибка"})
+	}
+
+	// Отправляем ключ отдельным сообщением
+	c.Bot().Send(c.Chat(), sub.KeyString)
+
+	return c.Respond(&tele.CallbackResponse{Text: "✅ Ключ отправлен ниже"})
+}
+
+// HandleExtend показывает варианты продления
+func (h *Handler) HandleExtend(c tele.Context) error {
+	respond(c)
+
+	subID, _ := strconv.ParseInt(c.Callback().Data, 10, 64)
+
+	sub, err := h.svc.GetSubscriptionByID(context.Background(), subID)
+	if err != nil {
+		return c.Respond(&tele.CallbackResponse{Text: "Подписка не найдена"})
+	}
+
+	plans := h.svc.GetPricingPlans(sub.Product.BasePrice)
+
+	text := fmt.Sprintf(`🔄 Продление подписки №%d
+
+%s %s
+Текущий срок: до %s
+
+Выберите срок продления:`, sub.ID, sub.Product.CountryFlag, sub.Product.Name, sub.ExpiresAt.Format("02.01.2006"))
+
+	menu := &tele.ReplyMarkup{}
+	var rows []tele.Row
+
+	for _, plan := range plans {
+		var btnText string
+		if plan.Discount > 0 {
+			btnText = fmt.Sprintf("%d мес (-%d%%) — %d ₽", plan.Months, plan.Discount, int(plan.Price))
+		} else {
+			btnText = fmt.Sprintf("%d мес — %d ₽", plan.Months, int(plan.Price))
+		}
+		btn := menu.Data(btnText, "extend_pay", fmt.Sprintf("%d:%d", subID, plan.Months))
+		rows = append(rows, menu.Row(btn))
+	}
+
+	rows = append(rows, menu.Row(menu.Data("⬅️ Назад", "sub", strconv.FormatInt(subID, 10))))
+	menu.Inline(rows...)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// ================= INSTRUCTIONS =================
+
+// HandleGuide обрабатывает /guide (то же что HandleInstruction)
+func (h *Handler) HandleGuide(c tele.Context) error {
+	return h.HandleInstruction(c)
+}
+
+// HandleInstruction показывает выбор устройства
+func (h *Handler) HandleInstruction(c tele.Context) error {
+	respond(c)
+
+	text := "📚 Выберите ваше устройство:"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(
+			menu.Data("📱 Android", "instr_android"),
+			menu.Data("💻 Windows", "instr_windows"),
+		),
+		menu.Row(
+			menu.Data("🍎 iPhone", "instr_iphone"),
+			menu.Data("🍏 Mac", "instr_mac"),
+		),
+		menu.Row(menu.Data("⬅️ Назад", "back_main")),
+	)
+
+	if c.Callback() != nil {
+		return editOrEditCaption(c, text, menu)
+	}
+	return h.editOrSend(c, text, menu)
+}
+
+// HandleInstrAndroid инструкция для Android
+func (h *Handler) HandleInstrAndroid(c tele.Context) error {
+	respond(c)
+
+	text := `📱 Android
+
+1. Скачайте V2RayTun из Google Play
+2. Скопируйте ключ из раздела "Мои подписки"
+3. В приложении нажмите + → "Добавить из буфера"
+4. Нажмите по центру для подключения`
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📥 Скачать V2RayTun", "https://play.google.com/store/apps/details?id=com.v2raytun.android")),
+		menu.Row(menu.Data("⬅️ Назад", "instruction")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleInstrWindows инструкция для Windows
+func (h *Handler) HandleInstrWindows(c tele.Context) error {
+	respond(c)
+
+	text := `💻 Windows
+
+1. Скачайте V2RayTun с GitHub
+2. Скопируйте ключ из раздела "Мои подписки"
+3. В приложении нажмите + → "Добавить из буфера"
+4. Нажмите по центру для подключения`
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📥 Скачать V2RayTun", "https://github.com/nicetry/v2raytun/releases")),
+		menu.Row(menu.Data("⬅️ Назад", "instruction")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleInstrIphone инструкция для iPhone
+func (h *Handler) HandleInstrIphone(c tele.Context) error {
+	respond(c)
+
+	text := `🍎 iPhone
+
+1. Скачайте V2RayTun или Streisand из App Store
+2. Скопируйте ключ из раздела "Мои подписки"
+3. Нажмите + → "Добавить из буфера"
+4. Разрешите вставку и запустите профиль`
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📥 V2RayTun", "https://apps.apple.com/app/v2raytun/id6476628951")),
+		menu.Row(menu.URL("📥 Streisand", "https://apps.apple.com/app/streisand/id6450534064")),
+		menu.Row(menu.Data("⬅️ Назад", "instruction")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleInstrMac инструкция для Mac
+func (h *Handler) HandleInstrMac(c tele.Context) error {
+	respond(c)
+
+	text := `🍏 Mac
+
+1. Скачайте V2RayTun из App Store
+2. Скопируйте ключ из раздела "Мои подписки"
+3. Нажмите + → "Добавить из буфера"
+4. Нажмите по центру для подключения`
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📥 Скачать V2RayTun", "https://apps.apple.com/app/v2raytun/id6476628951")),
+		menu.Row(menu.Data("⬅️ Назад", "instruction")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// ================= HELP =================
+
+// HandleHelp показывает раздел помощи
+func (h *Handler) HandleHelp(c tele.Context) error {
+	respond(c)
+
+	text := "🛟 Помощь\n\nВыберите раздел:"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.Data("❓ FAQ", "faq")),
+		menu.Row(menu.Data("⭐️ Отзывы", "reviews")),
+		menu.Row(menu.Data("💌 Оставить отзыв", "leave_review")),
+		menu.Row(menu.Data("📥 Поддержка", "support")),
+		menu.Row(menu.Data("📄 Соглашение", "privacy")),
+		menu.Row(menu.Data("⬅️ Назад", "back_main")),
+	)
+
+	if c.Callback() != nil {
+		return editOrEditCaption(c, text, menu)
+	}
+	return h.editOrSend(c, text, menu)
+}
+
+// HandleFAQ показывает FAQ
+func (h *Handler) HandleFAQ(c tele.Context) error {
+	respond(c)
+
+	text := `❓ Частые вопросы
+
+Q: VPN не работает?
+A: Переподключитесь. Не помогло — пишите в поддержку.
+
+Q: Сколько устройств?
+A: До 3-х одновременно на одном ключе.
+
+Q: Способы оплаты?
+A: Карты РФ и криптовалюта.
+
+Q: Скорость?
+A: 50-200 Мбит/с в зависимости от локации.`
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.Data("📥 Поддержка", "support")),
+		menu.Row(menu.Data("⬅️ Назад", "help")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleReviews показывает ссылку на отзывы
+func (h *Handler) HandleReviews(c tele.Context) error {
+	respond(c)
+
+	text := "⭐️ Отзывы пользователей\n\nЧитайте в нашем канале:"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📢 Канал отзывов", "https://t.me/your_reviews_channel")),
+		menu.Row(menu.Data("⬅️ Назад", "help")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleLeaveReview предлагает оставить отзыв
+func (h *Handler) HandleLeaveReview(c tele.Context) error {
+	respond(c)
+
+	text := "💌 Оставить отзыв\n\nНапишите нам — опубликуем в канале!"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("✍️ Написать", "https://t.me/your_support_bot")),
+		menu.Row(menu.Data("⬅️ Назад", "help")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandleSupport показывает контакты поддержки
+func (h *Handler) HandleSupport(c tele.Context) error {
+	respond(c)
+
+	text := "📥 Поддержка\n\nОтветим в течение 24 часов!"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("💬 Написать", "https://t.me/your_support_bot")),
+		menu.Row(menu.Data("⬅️ Назад", "help")),
+	)
+
+	return editOrEditCaption(c, text, menu)
+}
+
+// HandlePrivacy показывает пользовательское соглашение
+func (h *Handler) HandlePrivacy(c tele.Context) error {
+	respond(c)
+
+	text := "📄 Пользовательское соглашение"
+
+	menu := &tele.ReplyMarkup{}
+	menu.Inline(
+		menu.Row(menu.URL("📖 Читать", "https://telegra.ph/Publichnaya-oferta-01-01")),
+		menu.Row(menu.Data("⬅️ Назад", "help")),
+	)
+
+	if c.Callback() != nil {
+		return editOrEditCaption(c, text, menu)
+	}
+	return h.editOrSend(c, text, menu)
+}

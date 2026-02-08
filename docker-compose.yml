@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: vpn-telegram-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - CONFIG_PATH=/app/config.yaml
+      # Connect to postgres using the Docker network hostname (service name)
+      - DATABASE_URL=postgres://vpnbot:vpnbot_password@postgres:5432/vpnbot?sslmode=disable
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./db/migrations:/app/db/migrations:ro
+    networks:
+      - vpnbot-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: vpnbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vpnbot
+      POSTGRES_PASSWORD: vpnbot_password
+      POSTGRES_DB: vpnbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Expose to host for external DB tools (e.g., DBeaver, pgAdmin)
+      # Remove this section if you don't need external access
+      - "5432:5432"
+    networks:
+      - vpnbot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpnbot -d vpnbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+
+networks:
+  vpnbot-network:
+    driver: bridge

@@ -1,0 +1,50 @@
+package middleware
+
+import (
+	"fmt"
+	"log"
+
+	tele "gopkg.in/telebot.v3"
+)
+
+// AdminMiddleware проверяет, является ли пользователь администратором
+func AdminMiddleware(adminIDs []int64) tele.MiddlewareFunc {
+	// Валидация при создании middleware
+	if len(adminIDs) == 0 {
+		log.Panic("[AdminAuth] CRITICAL: No admin IDs configured! Bot will not start.")
+	}
+
+	return func(next tele.HandlerFunc) tele.HandlerFunc {
+		return func(c tele.Context) error {
+			userID := c.Sender().ID
+
+			// КРИТИЧЕСКОЕ логирование для отладки
+			for _, adminID := range adminIDs {
+				log.Printf("[AUTH DEBUG] UserID: %d | Required AdminID: %d | Match: %v", 
+					userID, adminID, userID == adminID)
+			}
+
+			// Строгая проверка с детальным логированием
+			isAdmin := false
+			for i, adminID := range adminIDs {
+				matches := userID == adminID
+				log.Printf("[AdminAuth] Compare[%d]: UserID=%d == AdminID=%d -> %v", i, userID, adminID, matches)
+				if matches {
+					isAdmin = true
+					log.Printf("[AdminAuth] ✅ MATCH FOUND at index %d", i)
+					break
+				}
+			}
+
+			if !isAdmin {
+				log.Printf("[AdminAuth] ❌ DENIED: UserID=%d not found in AdminIDs=%v", userID, adminIDs)
+				log.Printf("[AdminAuth] Type check: UserID type=%T, AdminID[0] type=%T", userID, adminIDs[0])
+				return c.Send(fmt.Sprintf("❌ Доступ запрещён.\n\nDEBUG: UserID=%d\nExpected: %v", userID, adminIDs))
+			}
+
+			log.Printf("[AdminAuth] ✅ GRANTED: UserID=%d authenticated", userID)
+			return next(c)
+		}
+	}
+}
+

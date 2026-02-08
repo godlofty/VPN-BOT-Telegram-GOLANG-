@@ -1,0 +1,36 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+vpn-bot
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Config with secrets
+config.yaml
+!config.example.yaml
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/
+
