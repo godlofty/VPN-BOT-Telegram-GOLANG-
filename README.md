@@ -58,6 +58,7 @@
 *   Установленная панель 3X-UI или X-UI на сервере
 
 ### 1. Кронирование репозитория
-git clone https://github.com/godlofty/vpn-bot.git
+git clone https://github.com/godlofty/VPN-BOT-Telegram-GOLANG-.git
 cd vpn-bot
+
 
